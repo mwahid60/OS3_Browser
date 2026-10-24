@@ -7,9 +7,11 @@ Ditulis dengan Rust + [ratatui](https://ratatui.rs).
 ## Fitur
 
 - Multi-koneksi S3 (MinIO, AWS S3, dan server S3-compatible lain seperti Dell ECS/ViPR)
+- **Tab per bucket** — buka banyak bucket sekaligus, tiap tab menyimpan lokasi, seleksi, tanda, dan filter-nya sendiri
 - 3 pane: sidebar (koneksi + bucket), main (listing), preview (isi folder / teks / gambar / metadata)
 - Find/filter live dengan satu search bar global
 - Upload multi-file, download (file tunggal / ZIP), copy/move antar prefix, delete dengan konfirmasi
+- Copy path S3 (`bucket/prefix/file`) ke clipboard dengan satu shortcut
 - Preview gambar via protokol terminal (kitty / iTerm2 / sixel, fallback halfblocks)
 - Dukungan mouse penuh (klik, klik kanan, scroll)
 - 3 gaya ikon (`nerd` / `unicode` / `ascii`) — ganti kapan saja dengan `Ctrl+G`
@@ -102,6 +104,10 @@ secret_key = "minioadmin"
 | `p` | paste ke folder saat ini (atau folder yang ter-highlight) |
 | `r` | refresh listing / bucket |
 | `/` | **find/filter** live di pane yang aktif |
+| `Shift+C` | **copy path S3** (`bucket/prefix/file`) item ter-highlight ke clipboard |
+| `Shift+.` / `Shift+,` | next / previous **tab** |
+| `Shift+T` | menu tab aktif: **Rename tab** / **Close tab** |
+| klik pada tab | pindah ke tab tersebut |
 | `n` / `N` | tambah koneksi S3 baru |
 | `?` | help |
 | `q` / `Ctrl+C` | keluar |
@@ -114,6 +120,15 @@ secret_key = "minioadmin"
 - `Shift+Enter` — **Test Connection** (membutuhkan terminal dengan kitty keyboard protocol; di terminal biasa gunakan klik)
 
 Koneksi yang belum di-mount tampil abu-abu; klik/`Enter` untuk mount. Tombol `[+ New Connection]` selalu tampil di bagian bawah sidebar.
+
+## Tab
+
+Setiap bucket yang dibuka (`Enter`/klik pada nama bucket) menjadi **tab** di baris judul, di samping badge `OS3 Browser`:
+
+- Membuka bucket yang **sudah punya tab** (koneksi + bucket sama) akan **melempar** kamu ke tab tersebut, bukan membuat duplikat.
+- Tiap tab menyimpan state-nya sendiri: lokasi folder, seleksi & scroll, item yang ditandai, dan filter find pane main.
+- Navigasi: `Shift+.` (next), `Shift+,` (prev), atau **klik** langsung pada tab.
+- `Shift+T` membuka menu **Rename tab** (hanya mengubah label tampilan) dan **Close tab**. Menutup tab terakhir mengembalikan ke layar awal.
 
 ## Find / Filter (`/`)
 

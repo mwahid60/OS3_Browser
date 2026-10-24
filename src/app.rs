@@ -38,6 +38,24 @@ pub struct Location {
     pub prefix: String, // "" or ends with "/"
 }
 
+/// Snapshot state satu tab (satu bucket). State yang ditampilkan di pane
+/// utama (`location`, `items`, `main_state`, `marked`, `find_main`,
+/// `preview_scroll`) disalin ke sini saat tab ditinggalkan, dan dimuat kembali
+/// saat tab diaktifkan.
+#[derive(Clone)]
+pub struct TabState {
+    pub conn_idx: usize,
+    pub bucket: String,
+    /// Nama tampilan tab (default = nama bucket; rename hanya mengubah ini).
+    pub label: String,
+    pub prefix: String,
+    pub items: Vec<S3Item>,
+    pub main_state: ListState,
+    pub marked: HashSet<String>,
+    pub find_main: FindState,
+    pub preview_scroll: u16,
+}
+
 pub enum AppEvent {
     BucketsLoaded {
         conn_idx: usize,
@@ -542,6 +560,12 @@ pub enum Mode {
         picker: Option<FilePickerState>,
         error: Option<String>,
     },
+    /// Popup menu tab (Shift+T): 0 = Rename tab, 1 = Close tab.
+    TabMenu {
+        selected: usize,
+    },
+    /// Popup input untuk mengganti nama tab aktif.
+    RenameTab(TextInput),
     Help,
 }
 
@@ -590,6 +614,12 @@ pub struct App {
     pub location: Option<Location>,
     pub items: Vec<S3Item>,
     pub main_state: ListState,
+    /// Tab yang sedang terbuka (satu bucket per tab).
+    pub tabs: Vec<TabState>,
+    /// Index tab aktif di `tabs` (`None` = belum ada tab).
+    pub active_tab: Option<usize>,
+    /// Area tab bar hasil hitung ui.rs saat draw (dibaca `handle_mouse`).
+    pub tab_areas: Vec<Rect>,
     /// Fitur find/filter (`/`): state milik pane yang sedang fokus.
     pub find: FindState,
     /// Filter khusus sidebar (terpisah dari filter main/preview pane).
@@ -667,6 +697,9 @@ impl App {
             location: None,
             items: vec![],
             main_state: ListState::default(),
+            tabs: vec![],
+            active_tab: None,
+            tab_areas: vec![],
             // fokus awal = Sidebar, jadi state find aktif mengikuti sidebar
             find: FindState {
                 scope: FindScope::Sidebar,
@@ -903,6 +936,18 @@ impl App {
                 self.sync_find_scope();
             }
             KeyCode::Char('n') | KeyCode::Char('N') => self.open_conn_form(None),
+            // --- tab system (global, berlaku di pane mana pun) ---
+            KeyCode::Char('>') => self.next_tab(1),
+            KeyCode::Char('<') => self.next_tab(-1),
+            KeyCode::Char('T') => {
+                if self.tabs.is_empty() {
+                    self.set_status("Belum ada tab");
+                } else {
+                    self.mode = Mode::TabMenu { selected: 0 };
+                }
+            }
+            // Shift+C: salin path S3 item yang sedang dipilih
+            KeyCode::Char('C') => self.copy_s3_path(),
             _ => match self.focus {
                 Focus::Sidebar => self.handle_sidebar_key(key).await,
                 Focus::Main => self.handle_main_key(key).await,
@@ -1277,6 +1322,8 @@ impl App {
     }
 
     fn unmount_conn(&mut self, ci: usize) {
+        // tutup dulu semua tab milik koneksi ini (index koneksi lain aman)
+        self.close_tabs_for_conn(ci);
         if let Some(node) = self.nodes.get_mut(ci) {
             node.mounted = false;
             node.expanded = false;
@@ -1297,6 +1344,16 @@ impl App {
             self.main_state.select(None);
             self.preview = PreviewState::Empty;
             self.clipboard = None;
+            self.loading = false;
+        }
+        // tab lain yang dimuat saat menutup tab koneksi ini bisa punya request
+        // listing yang barusan di-invalidasi; minta ulang agar tidak nyangkut
+        if self.location.is_some() && self.loading {
+            self.request_listing();
+        }
+        // preview tab lain itu juga dijadwalkan ulang (preview_due baru direset)
+        if self.location.is_some() {
+            self.schedule_preview();
         }
         // jaga seleksi sidebar tetap valid setelah rows menyusut
         let rows = self.sidebar_rows();
@@ -1341,18 +1398,249 @@ impl App {
     }
 
     fn open_bucket(&mut self, conn_idx: usize, bucket: String) {
-        self.location = Some(Location {
+        // Bucket yang sudah punya tab: pindah ke tab itu (jangan buat duplikat).
+        if let Some(idx) = self
+            .tabs
+            .iter()
+            .position(|t| t.conn_idx == conn_idx && t.bucket == bucket)
+        {
+            self.switch_tab(idx);
+            // membuka bucket dari sidebar memfokuskan main pane (perilaku lama)
+            self.store_find_scope();
+            self.focus = Focus::Main;
+            self.sync_find_scope();
+            // refresh isi tab (juga saat tab tersebut sudah aktif)
+            self.request_listing();
+            return;
+        }
+        let tab = TabState {
             conn_idx,
-            bucket,
+            bucket: bucket.clone(),
+            label: bucket,
             prefix: String::new(),
-        });
-        self.restore_highlight = None;
+            items: vec![],
+            main_state: ListState::default(),
+            marked: HashSet::new(),
+            find_main: FindState {
+                scope: FindScope::Main,
+                ..FindState::default()
+            },
+            preview_scroll: 0,
+        };
+        // simpan state tab lama sebelum pindah
+        self.save_active_tab();
+        self.tabs.push(tab);
+        let idx = self.tabs.len() - 1;
+        // switch_tab -> load_tab: tab baru masih kosong, jadi listing diminta
+        // di sana (setelah switch).
+        self.switch_tab(idx);
+        // membuka bucket dari sidebar memfokuskan main pane (perilaku lama)
         self.store_find_scope();
         self.focus = Focus::Main;
         self.sync_find_scope();
-        self.marked.clear();
+    }
+
+    // -----------------------------------------------------------------------
+    // Tab system
+    // -----------------------------------------------------------------------
+
+    /// Salin state pane utama ke tab yang sedang aktif.
+    fn save_active_tab(&mut self) {
+        // pastikan slot find milik pane yang fokus (terutama main) ikut tersimpan
+        self.store_find_scope();
+        let Some(idx) = self.active_tab else { return };
+        let Some(loc) = self.location.clone() else { return };
+        let Some(tab) = self.tabs.get_mut(idx) else { return };
+        tab.conn_idx = loc.conn_idx;
+        tab.bucket = loc.bucket;
+        tab.prefix = loc.prefix;
+        tab.items = self.items.clone();
+        tab.main_state = self.main_state.clone();
+        tab.marked = self.marked.clone();
+        tab.find_main = self.find_main.clone();
+        tab.preview_scroll = self.preview_scroll;
+    }
+
+    /// Muat state tab `idx` ke pane utama (kebalikan `save_active_tab`).
+    fn load_tab(&mut self, idx: usize) {
+        let Some(tab) = self.tabs.get(idx) else { return };
+        let location = Location {
+            conn_idx: tab.conn_idx,
+            bucket: tab.bucket.clone(),
+            prefix: tab.prefix.clone(),
+        };
+        let items = tab.items.clone();
+        let main_state = tab.main_state.clone();
+        let marked = tab.marked.clone();
+        let find_main = tab.find_main.clone();
+        let preview_scroll = tab.preview_scroll;
+
+        // simpan state find pane yang aktif dulu, baru muat slot milik tab tujuan
+        self.store_find_scope();
+        self.location = Some(location);
+        self.items = items;
+        self.main_state = main_state;
+        self.marked = marked;
+        self.find_main = find_main;
+        if self.find.scope == FindScope::Main {
+            // `find` yang sedang aktif adalah milik main pane: ikut berganti.
+            let active = self.find.active;
+            self.find = self.find_main.clone();
+            self.find.scope = FindScope::Main;
+            self.find.active = active;
+            self.find.cursor = self.find.query.len();
+        }
+        // slot find (sidebar/preview) tetap global, hanya scope main yang per-tab
+        self.sync_find_scope();
+
+        self.preview_scroll = preview_scroll;
+        // preview lama milik tab sebelumnya tidak valid
+        self.preview = PreviewState::Empty;
+        self.preview_list_state = ListState::default();
+        self.preview_due = None;
+        self.loading = false;
+        self.restore_highlight = None;
         self.visual = false;
-        self.request_listing();
+        // invalidasi response listing yang masih in-flight dari tab sebelumnya
+        self.current_listing_req = self.next_req();
+        // debounce preview yang sudah ada; request_preview() jalan di on_tick
+        self.schedule_preview();
+        if self.items.is_empty() {
+            self.request_listing();
+        }
+    }
+
+    fn switch_tab(&mut self, idx: usize) {
+        if idx >= self.tabs.len() || self.active_tab == Some(idx) {
+            return;
+        }
+        self.save_active_tab();
+        self.active_tab = Some(idx);
+        self.load_tab(idx);
+        self.visual = false;
+    }
+
+    /// Pindah tab secara cyclic.
+    fn next_tab(&mut self, delta: isize) {
+        if self.tabs.is_empty() {
+            return;
+        }
+        let Some(cur) = self.active_tab else {
+            self.switch_tab(0);
+            return;
+        };
+        let len = self.tabs.len() as isize;
+        let next = (cur as isize + delta).rem_euclid(len) as usize;
+        self.switch_tab(next);
+    }
+
+    fn close_tab(&mut self, idx: usize) {
+        if idx >= self.tabs.len() {
+            return;
+        }
+        let active = self.active_tab;
+        let was_active = active == Some(idx);
+        // JANGAN save_active_tab() di sini: tab ini sedang dibuang.
+        self.tabs.remove(idx);
+
+        if self.tabs.is_empty() {
+            self.active_tab = None;
+            self.location = None;
+            self.items = vec![];
+            self.main_state = ListState::default();
+            self.marked.clear();
+            self.visual = false;
+            self.find_main = FindState {
+                scope: FindScope::Main,
+                ..FindState::default()
+            };
+            if self.find.scope == FindScope::Main {
+                self.find = FindState {
+                    scope: FindScope::Main,
+                    ..FindState::default()
+                };
+            }
+            self.preview = PreviewState::Empty;
+            self.preview_scroll = 0;
+            self.preview_list_state = ListState::default();
+            self.preview_due = None;
+            self.loading = false;
+            self.restore_highlight = None;
+            self.current_listing_req = self.next_req();
+            self.current_preview_req = self.next_req();
+            self.set_status("Tab ditutup");
+            return;
+        }
+
+        // Index tab aktif bisa bergeser bila tab yang ditutup ada di depannya.
+        let new_active = match active {
+            Some(_) if was_active => Some(idx.min(self.tabs.len() - 1)),
+            Some(a) if idx < a => Some(a - 1),
+            other => other,
+        };
+        if was_active {
+            // pastikan load_tab tidak menyimpan state tab yang sudah dibuang
+            self.active_tab = None;
+            if let Some(n) = new_active {
+                self.load_tab(n);
+            }
+            self.active_tab = new_active;
+            self.visual = false;
+        } else {
+            self.active_tab = new_active;
+        }
+    }
+
+    /// Tutup semua tab milik satu koneksi (dari belakang agar index tidak geser).
+    fn close_tabs_for_conn(&mut self, ci: usize) {
+        let idxs: Vec<usize> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.conn_idx == ci)
+            .map(|(i, _)| i)
+            .collect();
+        for i in idxs.into_iter().rev() {
+            self.close_tab(i);
+        }
+    }
+
+    fn rename_tab(&mut self, label: String) {
+        let label = label.trim().to_string();
+        if label.is_empty() {
+            self.set_error("Nama tab tidak boleh kosong");
+            return;
+        }
+        let Some(idx) = self.active_tab else {
+            self.set_error("Tidak ada tab aktif");
+            return;
+        };
+        let Some(tab) = self.tabs.get_mut(idx) else {
+            self.set_error("Tab tidak ditemukan");
+            return;
+        };
+        tab.label = label.clone();
+        self.set_status(format!("Tab diganti nama: {label}"));
+    }
+
+    /// Shift+C: salin path S3 (`bucket/key`) item terpilih ke clipboard sistem.
+    fn copy_s3_path(&mut self) {
+        let Some(loc) = self.location.clone() else {
+            self.set_error("Tidak ada bucket yang dibuka");
+            return;
+        };
+        let Some(item) = self.selected_item().cloned() else {
+            self.set_error("Tidak ada item yang dipilih");
+            return;
+        };
+        let path = format!("{}/{}", loc.bucket, item.key);
+        match arboard::Clipboard::new() {
+            Ok(mut cb) => match cb.set_text(path.clone()) {
+                Ok(_) => self.set_status(format!("Path tersalin: {path}")),
+                Err(e) => self.set_error(format!("Gagal menyalin path: {e}")),
+            },
+            Err(e) => self.set_error(format!("Clipboard tidak tersedia: {e}")),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -2393,7 +2681,15 @@ impl App {
             return;
         }
         self.config = new_cfg;
+        // tutup semua tab koneksi ini SEBELUM nodes.remove agar index masih valid
+        self.close_tabs_for_conn(ci);
         self.nodes.remove(ci);
+        // index koneksi bergeser -> tab setelahnya ikut bergeser
+        for tab in &mut self.tabs {
+            if tab.conn_idx > ci {
+                tab.conn_idx -= 1;
+            }
+        }
         // index client bergeser -> rebuild lazy
         self.clients.clear();
         // clipboard/marked mengacu koneksi by-index -> tidak valid lagi
@@ -2419,6 +2715,15 @@ impl App {
             self.items = vec![];
             self.main_state.select(None);
             self.preview = PreviewState::Empty;
+            self.loading = false;
+        } else if self.location.is_some() && self.loading {
+            // tab yang dimuat saat menutup tab koneksi ini sempat meminta
+            // listing yang kemudian di-invalidasi; minta ulang.
+            self.request_listing();
+        }
+        // preview tab yang masih terbuka dijadwalkan ulang (preview_due direset)
+        if self.location.is_some() {
+            self.schedule_preview();
         }
         // jaga seleksi sidebar tetap valid
         let rows = self.sidebar_rows();
@@ -2788,6 +3093,39 @@ impl App {
                     };
                 }
             }
+            Mode::TabMenu { selected } => match key.code {
+                KeyCode::Esc => {}
+                // toggle pilihan 0 (Rename) <-> 1 (Close)
+                KeyCode::Up | KeyCode::Down => {
+                    self.mode = Mode::TabMenu {
+                        selected: 1 - selected.min(1),
+                    };
+                }
+                KeyCode::Enter => {
+                    if selected.min(1) == 0 {
+                        if let Some(idx) = self.active_tab {
+                            if let Some(tab) = self.tabs.get(idx) {
+                                let mut input = TextInput::new();
+                                input.value = tab.label.clone();
+                                input.cursor = input.value.len();
+                                self.mode = Mode::RenameTab(input);
+                            }
+                        }
+                    } else if let Some(idx) = self.active_tab {
+                        // mode tetap Normal setelah menutup tab
+                        self.close_tab(idx);
+                    }
+                }
+                _ => self.mode = Mode::TabMenu { selected },
+            },
+            Mode::RenameTab(mut input) => match key.code {
+                KeyCode::Esc => {}
+                KeyCode::Enter => self.rename_tab(input.value.clone()),
+                _ => {
+                    input.handle(&key);
+                    self.mode = Mode::RenameTab(input);
+                }
+            },
             Mode::Normal => {}
         }
     }
@@ -2799,6 +3137,13 @@ impl App {
     async fn handle_mouse(&mut self, col: u16, row: u16) {
         if !matches!(self.mode, Mode::Normal) {
             return;
+        }
+        // tab bar: klik area tab -> pindah tab (dicek sebelum area pane lain)
+        for (i, r) in self.tab_areas.iter().enumerate() {
+            if inside(col, row, *r) {
+                self.switch_tab(i);
+                return;
+            }
         }
         // footer statis "+ New Connection" di bawah sidebar
         if inside(col, row, self.newconn_area) {

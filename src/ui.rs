@@ -436,11 +436,51 @@ fn zoom_active(app: &App) -> bool {
     app.zoom == Some(app.focus)
 }
 
-fn draw_title(f: &mut Frame, app: &App, area: Rect) {
-    let mut spans = vec![Span::styled(
+fn draw_title(f: &mut Frame, app: &mut App, area: Rect) {
+    // Rebuild setiap frame: area tab dihitung ulang oleh ui.rs lalu dipakai
+    // `App::handle_mouse` untuk klik pindah tab.
+    app.tab_areas.clear();
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let style_icons = app.icon_style;
+    let badge = Span::styled(
         " OS3 Browser ",
         Style::default().fg(Color::Black).bg(Color::Cyan).bold(),
-    )];
+    );
+    let mut x = u32::from(area.x).saturating_add(badge.width() as u32);
+    let limit = u32::from(area.x).saturating_add(u32::from(area.width));
+    let mut spans = vec![badge];
+    // Spasi polos (tanpa warna) sebagai jarak 1 karakter antara badge dan tab
+    // pertama, supaya blok warna keduanya tidak menyambung.
+    spans.push(Span::raw(" "));
+    x = x.saturating_add(1);
+
+    for (i, tab) in app.tabs.iter().enumerate() {
+        if x >= limit {
+            break;
+        }
+        // Label dipotong maksimal 20 kolom supaya tab panjang tidak mendominasi bar.
+        let label = truncate_to_width(&tab.label, 20, style_icons);
+        let w = 1u32 + label.width() as u32 + 1u32; // " label "
+        if x.saturating_add(w) > limit {
+            break; // hanya tab yang muat penuh yang dirender + bisa diklik
+        }
+        let tab_style = if app.active_tab == Some(i) {
+            Style::default().fg(Color::Black).bg(Color::Yellow).bold()
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        spans.push(Span::styled(format!(" {label} "), tab_style));
+        app.tab_areas.push(Rect::new(
+            x as u16,
+            area.y,
+            w.min(u32::from(u16::MAX)) as u16,
+            1,
+        ));
+        x = x.saturating_add(w);
+    }
+
     if zoom_active(app) {
         spans.push(Span::styled(
             " [ZOOM]",
@@ -1540,6 +1580,79 @@ fn draw_popup(f: &mut Frame, app: &mut App, area: Rect) {
                 Paragraph::new(" y/Enter hapus   tombol lain batal")
                     .style(Style::default().fg(Color::Yellow).bold()),
                 body[1],
+            );
+        }
+        Mode::TabMenu { selected } => {
+            let rect = centered_rect(30, 20, area);
+            f.render_widget(Clear, rect);
+            let block = popup_block("Tab", style);
+            let inner = block.inner(rect);
+            f.render_widget(block, rect);
+            let body = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
+
+            let options = ["Rename tab", "Close tab"];
+            let items: Vec<ListItem> = options
+                .iter()
+                .enumerate()
+                .map(|(i, o)| {
+                    let style = if i == *selected {
+                        Style::default().fg(Color::Black).bg(Color::Yellow)
+                    } else {
+                        Style::default().fg(Color::White)
+                    };
+                    ListItem::new(format!(" {o} ")).style(style)
+                })
+                .collect();
+            f.render_widget(List::new(items), body[0]);
+            f.render_widget(
+                Paragraph::new(" Enter pilih   Esc batal")
+                    .style(Style::default().fg(Color::DarkGray)),
+                body[1],
+            );
+        }
+        Mode::RenameTab(input) => {
+            let rect = centered_rect(48, 20, area);
+            f.render_widget(Clear, rect);
+            let block = popup_block("Rename Tab", style);
+            let inner = block.inner(rect);
+            f.render_widget(block, rect);
+            let body = Layout::vertical([
+                Constraint::Length(1), // hint
+                Constraint::Length(1), // input + kursor
+                Constraint::Min(0),
+                Constraint::Length(1), // footer
+            ])
+            .split(inner);
+
+            let text_style = Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .bold();
+            let byte = safe_cursor(&input.value, input.cursor);
+            let mut spans: Vec<Span> = Vec::new();
+            if byte > 0 {
+                spans.push(Span::styled(input.value[..byte].to_string(), text_style));
+            }
+            spans.push(Span::styled(
+                "|".to_string(),
+                Style::default()
+                    .fg(Color::White)
+                    .bg(Color::Yellow)
+                    .bold(),
+            ));
+            if byte < input.value.len() {
+                spans.push(Span::styled(input.value[byte..].to_string(), text_style));
+            }
+
+            f.render_widget(
+                Paragraph::new("Nama tab:").style(Style::default().fg(Color::DarkGray)),
+                body[0],
+            );
+            f.render_widget(Paragraph::new(Line::from(spans)), body[1]);
+            f.render_widget(
+                Paragraph::new(" Enter simpan   Esc batal")
+                    .style(Style::default().fg(Color::DarkGray)),
+                body[3],
             );
         }
     }

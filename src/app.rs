@@ -535,6 +535,9 @@ pub enum Mode {
         selected: usize,
     },
     NewFolder(TextInput),
+    /// Rename file (S3 tidak punya rename: copy + delete).
+    /// Menyimpan nama file lama; TextInput berisi nama baru yang diedit user.
+    RenameItem { old_name: String, input: TextInput },
     FilePicker(FilePickerState),
     DeleteConfirm {
         targets: Vec<DeleteTarget>,
@@ -599,6 +602,7 @@ const BUSY_COPY_MOVE: &str = "Copy/Move";
 const BUSY_DELETE: &str = "Delete";
 const BUSY_UPLOAD: &str = "Upload";
 const BUSY_DOWNLOAD: &str = "Download";
+const BUSY_RENAME: &str = "Rename";
 
 // ---------------------------------------------------------------------------
 // App
@@ -948,6 +952,7 @@ impl App {
             }
             // Shift+C: salin path S3 item yang sedang dipilih
             KeyCode::Char('C') => self.copy_s3_path(),
+            KeyCode::Char('R') => self.start_rename(),
             _ => match self.focus {
                 Focus::Sidebar => self.handle_sidebar_key(key).await,
                 Focus::Main => self.handle_main_key(key).await,
@@ -1641,6 +1646,99 @@ impl App {
             },
             Err(e) => self.set_error(format!("Clipboard tidak tersedia: {e}")),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Rename (file saja; S3 tidak punya rename native: copy + delete)
+    // -----------------------------------------------------------------------
+
+    /// Buka popup rename untuk file yang sedang ter-highlight.
+    fn start_rename(&mut self) {
+        if !self.ensure_idle() {
+            return;
+        }
+        let Some(item) = self.selected_item().cloned() else {
+            self.set_error("Tidak ada item yang dipilih");
+            return;
+        };
+        if item.is_dir {
+            self.set_error("Rename hanya didukung untuk file (folder tidak didukung)");
+            return;
+        }
+        let old = item.name.clone();
+        self.mode = Mode::RenameItem {
+            old_name: old.clone(),
+            input: TextInput {
+                value: old.clone(),
+                cursor: old.len(),
+            },
+        };
+    }
+
+    /// Jalankan rename: validasi nama baru, lalu copy+delete di background.
+    fn rename_item(&mut self, old_name: String, new_name: String) {
+        let new_name = new_name.trim().to_string();
+        if new_name.is_empty() {
+            self.set_error("Nama baru tidak boleh kosong");
+            return;
+        }
+        if new_name == old_name {
+            self.set_status("Nama tidak berubah");
+            return;
+        }
+        if new_name.contains('/') || new_name.contains('\\') {
+            self.set_error("Nama file tidak boleh mengandung '/' atau '\\\\'");
+            return;
+        }
+        if new_name == "." || new_name == ".." {
+            self.set_error("Nama file tidak valid");
+            return;
+        }
+        let Some(loc) = self.location.clone() else {
+            self.set_error("Tidak ada bucket aktif");
+            return;
+        };
+        let Some(client) = self.client(loc.conn_idx) else {
+            self.set_error("Koneksi tidak aktif");
+            return;
+        };
+        if !self.ensure_idle() {
+            return;
+        }
+        let old_key = format!("{}{}", loc.prefix, old_name);
+        let new_key = format!("{}{}", loc.prefix, new_name);
+        let bucket = loc.bucket.clone();
+        let tx = self.tx.clone();
+        self.busy = Some(BUSY_RENAME);
+        self.set_status(format!("Rename {old_name} -> {new_name} ..."));
+        tokio::spawn(async move {
+            // S3 tidak punya rename: copy ke key baru, lalu hapus key lama.
+            let result: Result<String, String> = async {
+                if client.exists(&bucket, &new_key).await.unwrap_or(false) {
+                    return Err(format!("nama '{new_name}' sudah ada di folder ini"));
+                }
+                client
+                    .copy_object(&bucket, &bucket, &old_key, &new_key)
+                    .await
+                    .map_err(|e| format!("copy gagal: {e}"))?;
+                client
+                    .delete_keys(&bucket, vec![old_key.clone()])
+                    .await
+                    .map_err(|e| format!("copy sukses tapi hapus file lama gagal: {e}"))?;
+                Ok(format!("Rename: {old_name} -> {new_name}"))
+            }
+            .await;
+            let (message, is_error) = match result {
+                Ok(m) => (m, false),
+                Err(e) => (format!("Rename gagal: {e}"), true),
+            };
+            let _ = tx.send(AppEvent::OpDone {
+                message,
+                is_error,
+                refresh: true,
+                restore: None,
+            });
+        });
     }
 
     // -----------------------------------------------------------------------
@@ -2798,6 +2896,14 @@ impl App {
                 _ => {
                     input.handle(&key);
                     self.mode = Mode::NewFolder(input);
+                }
+            },
+            Mode::RenameItem { old_name, mut input } => match key.code {
+                KeyCode::Esc => {}
+                KeyCode::Enter => self.rename_item(old_name, input.value.clone()),
+                _ => {
+                    input.handle(&key);
+                    self.mode = Mode::RenameItem { old_name, input };
                 }
             },
             Mode::FilePicker(mut fp) => {

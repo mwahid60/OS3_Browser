@@ -99,6 +99,7 @@ secret_key = "minioadmin"
 | `a` | add: **New Folder** / **Insert New File** (upload, multi-file) |
 | `d` | **download** item tertandai / ter-highlight (popup) — ZIP bila >1 item atau folder |
 | `D` (Shift+D) | hapus item tertandai / ter-highlight (popup konfirmasi) |
+| `Shift+R` | **rename file** (copy + delete; folder tidak didukung) |
 | `c` | copy mode — navigasi ke tujuan lalu `p` untuk paste; `c` lagi = batal |
 | `x` | move mode — sama seperti copy; `x` lagi = batal |
 | `p` | paste ke folder saat ini (atau folder yang ter-highlight) |

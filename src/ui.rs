@@ -955,6 +955,39 @@ fn draw_popup(f: &mut Frame, app: &mut App, area: Rect) {
             let y = (inner.y + 1).min(inner.y + inner.height.saturating_sub(1));
             f.set_cursor_position(Position::new(x, y));
         }
+        Mode::RenameItem { old_name, input } => {
+            let rect = centered_rect(54, 24, area);
+            f.render_widget(Clear, rect);
+            let block = popup_block("Rename File", style);
+            let inner = block.inner(rect);
+            f.render_widget(block, rect);
+
+            let lines = vec![
+                Line::from(Span::styled(
+                    format!("Lama: {old_name}"),
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(Span::styled("Nama baru:", Style::default().fg(Color::DarkGray))),
+                Line::from(Span::styled(
+                    input.value.clone(),
+                    Style::default().fg(Color::White).underlined(),
+                )),
+                Line::raw(""),
+                Line::from(Span::styled(
+                    "Enter rename   Esc batal",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ];
+            f.render_widget(Paragraph::new(lines), inner);
+
+            let col = input.value[..safe_cursor(&input.value, input.cursor)].width() as u16;
+            let x = inner
+                .x
+                .saturating_add(col)
+                .min(inner.x + inner.width.saturating_sub(1));
+            let y = (inner.y + 2).min(inner.y + inner.height.saturating_sub(1));
+            f.set_cursor_position(Position::new(x, y));
+        }
         Mode::FilePicker(fp) => {
             let rect = centered_rect(72, 70, area);
             f.render_widget(Clear, rect);
@@ -1669,32 +1702,33 @@ fn draw_help(f: &mut Frame, area: Rect, style: IconStyle) {
     let inner = block.inner(rect);
     f.render_widget(block, rect);
 
-    let help: [(&str, &str); 29] = [
+    let help: [(&str, &str); 33] = [
         ("Navigasi", ""),
         ("  Up/Down / j/k", "pilih item"),
         ("  -> / Enter / l", "buka folder / bucket"),
         ("  <- / h", "mundur ke folder induk"),
-        ("  Tab / BackTab", "pindah pane sidebar->main->preview"),
+        ("  Tab / Shift+Tab", "pindah pane sidebar->main->preview"),
+        ("  Shift+. / Shift+,", "next / previous tab"),
+        ("  Shift+T", "menu tab aktif: rename / close"),
         ("  Ctrl+Z", "zoom / unzoom pane"),
-        ("  mouse", "klik/wheel   klik kanan koneksi = menu"),
-        ("  /", "cari/filter live (hanya pane/popup yang aktif)"),
-        ("  Esc", "nonaktifkan input; Esc lagi = hapus filter"),
+        ("  mouse", "klik/wheel; klik tab = pindah; klik kanan koneksi = menu"),
+        ("  /", "cari/filter live (pane/popup yang aktif)"),
+        ("  Esc", "nonaktifkan input; Esc lagi = hapus semua filter"),
         ("Seleksi", ""),
-        ("  Space", "tandai di main / menu koneksi di sidebar"),
+        ("  Space", "tandai item di main / menu koneksi di sidebar"),
         ("  v", "mode visual: tandai sambil navigasi Up/Down"),
-        ("  V", "reset semua tanda"),
+        ("  Shift+V", "reset semua tanda"),
         ("Operasi", ""),
         ("  a", "add: new folder / insert new file (upload)"),
-        ("  D (shift+d)", "hapus item tertandai / ter-highlight"),
-        (
-            "  d",
-            "download item tertandai / ter-highlight (popup) -> ZIP bila >1 atau folder",
-        ),
+        ("  d", "download item (popup) -> ZIP bila >1 item atau folder"),
+        ("  Shift+D", "hapus item tertandai / ter-highlight"),
+        ("  Shift+R", "rename file (copy + delete; folder tidak didukung)"),
+        ("  Shift+C", "copy path S3 (bucket/prefix/file) ke clipboard"),
         ("  c / x", "copy mode / move mode"),
         ("  p", "paste ke folder saat ini / ter-highlight"),
         ("  r", "refresh"),
         ("Koneksi", ""),
-        ("  N", "tambah koneksi S3 baru"),
+        ("  n / Shift+N", "tambah koneksi S3 baru"),
         (
             "  space / klik kanan",
             "mount / unmount / edit / delete koneksi",
